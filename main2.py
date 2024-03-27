@@ -1,4 +1,5 @@
 from facenet_pytorch import InceptionResnetV1, MTCNN
+from torch.utils.data import Dataset
 from PIL import Image
 import torch
 import os
@@ -6,7 +7,33 @@ from label import parse_fg_file
 import numpy as np 
 import math
 import random 
-from torchvision.transforms import ToTensor
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from torch.utils.data import random_split
+
+class CustomDataset(Dataset):
+    def __init__(self, image_paths, labels, scaling_constant, transform=None):
+        self.image_paths = image_paths
+        self.labels = labels  # Assuming this is already a tensor of shape (num_samples, 130)
+        self.transform = transform
+        self.scaling_constant = scaling_constant
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        # Load image
+        image = Image.open(self.image_paths[idx])
+
+        # Apply transformations (e.g., converting to tensor)
+        if self.transform:
+            image = self.transform(image)
+
+        # Get the corresponding label tensor
+        label = torch.tensor(self.labels[idx]) / self.scaling_constant
+
+        return image, label
+
 
 def loss_function(predictions, labels):
     loss = torch.nn.MSELoss()
@@ -22,13 +49,13 @@ def load_images(directory):
         identifier = '_'.join(filepath.split('_')[:3])
         if filepath[-3:] != '.fg':
             try:
-                inputs.append(Image.open(filepath))
+                inputs.append(filepath)
             except:
                 print(f'Invalid file path {filepath}')
                 return
             fg_file = identifier + '.fg'
             label = parse_fg_file(fg_file)
-            label = torch.tensor(list(label['symmetric_shape_modes']) + list(label['asymmetric_shape_modes']) + list(label['symmetric_texture_modes']))
+            label = list(label['symmetric_shape_modes']) + list(label['asymmetric_shape_modes']) + list(label['symmetric_texture_modes'])
             labels.append(label)
 
     return inputs, labels
@@ -41,15 +68,6 @@ def get_max_label_value(labels):
                 current_max = abs(value)
     return current_max
 
-
-def create_batches(data, batch_size):
-    random.shuffle(data)
-
-    batched_data = []
-    for i in range(0, len(data), batch_size):
-        
-        batched_data.append(data[i:i+batch_size])
-    return batched_data
 
 
 
@@ -66,28 +84,34 @@ def reset_weights(m):
             layer.reset_parameters()
 
 
-def image_to_tensor(imgs):
-    transform = ToTensor()
-    imgs = [transform(img) for img in imgs]
-    imgs = torch.stack(imgs, dim=0)
-    return imgs
 
 def train_model(directory):
 
     inputs, labels = load_images(directory)
-    split_ratio = 0.8
-    final_idx = round(len(inputs) * split_ratio)
-    indices = list(range(len(inputs)))
-    random.shuffle(indices)
-
-    inputs_train = [inputs[i] for i in indices[:final_idx]]
-    labels_train = [labels[i] for i in indices[:final_idx]]
-
-    inputs_test = [inputs[i] for i in indices[final_idx:]]
-    labels_test = torch.stack([labels[i] for i in indices[final_idx:]], dim=0)
 
     scaling_constant = get_max_label_value(labels)
-    labels_test = labels_test
+
+    # Define a transform to convert images to tensors and any other preprocessing
+    transform = transforms.Compose([
+        transforms.ToTensor(),  # Convert image to PyTorch tensor
+        # Add other transformations as needed, e.g., resizing, normalization
+        transforms.Resize((224, 224)),  # Resize to a common size if your model requires it
+    ])
+
+    dataset = CustomDataset(inputs, labels, scaling_constant, transform=transform)
+
+    # Let's assume `dataset` is an instance of your CustomDataset
+    dataset_size = len(dataset)
+    train_size = int(dataset_size * 0.8)  # 80% of the dataset for training
+    test_size = dataset_size - train_size  # The remaining 20% for testing
+
+    # Split the dataset into training and testing sets
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+    # Create DataLoaders for each set
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
 
     epochs = 1000
     batch_size = 50
@@ -101,30 +125,20 @@ def train_model(directory):
 
 
     initial_weights = resnet.last_linear.weight.data.clone()
-    optimizer = torch.optim.SGD(resnet.parameters(), lr=0.001, momentum=0.9)
+    optimizer = torch.optim.SGD(resnet.parameters(), lr=0.01, momentum=0.9)
     for epoch in range(epochs):
-        batched_inputs = create_batches(inputs_train, batch_size)
-        batched_labels = create_batches(labels_train, batch_size)
         
-        for i in range(len(batched_inputs)):
+        
+        for inputs, labels in train_loader:
        
 
             optimizer.zero_grad()
-
-            current_inputs = image_to_tensor(batched_inputs[i])
-       
-            current_labels = torch.stack(batched_labels[i], dim=0) / scaling_constant
            
             
 
-            embeddings = resnet(current_inputs)
-           
-            print(embeddings.shape)
-            print(current_labels.shape)
-
+            embeddings = resnet(inputs) 
             
-            
-            loss = loss_function(embeddings, current_labels)
+            loss = loss_function(embeddings, labels)
             loss.backward()
 
             optimizer.step()
